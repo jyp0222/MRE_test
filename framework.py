@@ -45,7 +45,10 @@ class GCDMRelFramework(object):
         test_dataloader,
         base_category,
         novel_category,
+        runtime_check_every: int = 0,
     ) -> None:
+        if runtime_check_every < 0:
+            raise ValueError("runtime_check_every must be greater than or equal to 0")
         self.__train_dataloader = train_dataloader
         self.__val_dataloader = val_dataloader
         self.__test_dataloader = test_dataloader
@@ -55,6 +58,8 @@ class GCDMRelFramework(object):
         self.__train_n_class = len(self.__train_class)
         self.__val_n_class = len(self.__val_class)
         self.__test_n_class = len(self.__test_class)
+        self.__runtime_check_every = runtime_check_every
+        self.__train_step = 0
 
         self.progress = Progress(
             SpinnerColumn(),
@@ -86,22 +91,190 @@ class GCDMRelFramework(object):
         )
         label = tf.reshape(label, shape=(-1,))
         return (data, label)
+
+    def __check_batch(self, data, label, name, num_classes):
+        if len(data) != 5:
+            raise ValueError(f"{name} data must contain 5 tensors, got {len(data)}")
+
+        s_ind, s_seg, head_idx, tail_idx, img = data
+        for tensor_name, tensor in (
+            ("sentence_indices", s_ind),
+            ("sentence_segments", s_seg),
+            ("head_idx", head_idx),
+            ("tail_idx", tail_idx),
+            ("label", label),
+        ):
+            tf.debugging.assert_type(
+                tensor, tf.int64, message=f"{name}.{tensor_name} must be tf.int64"
+            )
+        tf.debugging.assert_type(
+            img, tf.float32, message=f"{name}.img must be tf.float32"
+        )
+
+        tf.debugging.assert_rank(s_ind, 2, message=f"{name}.sentence_indices")
+        tf.debugging.assert_rank(s_seg, 2, message=f"{name}.sentence_segments")
+        tf.debugging.assert_rank(head_idx, 2, message=f"{name}.head_idx")
+        tf.debugging.assert_rank(tail_idx, 2, message=f"{name}.tail_idx")
+        tf.debugging.assert_rank(label, 1, message=f"{name}.label")
+        tf.debugging.assert_rank(img, 4, message=f"{name}.img")
+
+        batch_size = tf.shape(label)[0]
+        tf.debugging.assert_positive(batch_size, message=f"{name} batch is empty")
+        tf.debugging.assert_equal(
+            tf.shape(s_ind), tf.shape(s_seg), message=f"{name} token/segment shape mismatch"
+        )
+        for tensor_name, tensor in (
+            ("sentence_indices", s_ind),
+            ("head_idx", head_idx),
+            ("tail_idx", tail_idx),
+            ("img", img),
+        ):
+            tf.debugging.assert_equal(
+                tf.shape(tensor)[0],
+                batch_size,
+                message=f"{name}.{tensor_name} batch dimension mismatch",
+            )
+        tf.debugging.assert_equal(
+            tf.shape(head_idx)[1], 1, message=f"{name}.head_idx must have shape [B, 1]"
+        )
+        tf.debugging.assert_equal(
+            tf.shape(tail_idx)[1], 1, message=f"{name}.tail_idx must have shape [B, 1]"
+        )
+        tf.debugging.assert_equal(
+            tf.shape(img)[1:],
+            tf.constant([384, 384, 3], dtype=tf.int32),
+            message=f"{name}.img must have shape [B, 384, 384, 3]",
+        )
+
+        seq_len = tf.shape(s_ind)[1]
+        for tensor_name, tensor in (("head_idx", head_idx), ("tail_idx", tail_idx)):
+            tf.debugging.assert_greater_equal(
+                tensor, tf.cast(0, tensor.dtype), message=f"{name}.{tensor_name} is negative"
+            )
+            tf.debugging.assert_less(
+                tensor,
+                tf.cast(seq_len, tensor.dtype),
+                message=f"{name}.{tensor_name} exceeds sequence length",
+            )
+        tf.debugging.assert_greater_equal(
+            label, tf.cast(0, label.dtype), message=f"{name}.label is negative"
+        )
+        tf.debugging.assert_less(
+            label,
+            tf.cast(num_classes, label.dtype),
+            message=f"{name}.label exceeds the configured class count",
+        )
+        tf.debugging.assert_all_finite(img, message=f"{name}.img contains NaN or Inf")
+
+    def __check_vector(self, tensor, batch_size, name):
+        tf.debugging.assert_rank(tensor, 1, message=f"{name} must have shape [B]")
+        tf.debugging.assert_equal(
+            tf.shape(tensor)[0], batch_size, message=f"{name} batch dimension mismatch"
+        )
+        tf.debugging.assert_all_finite(tensor, message=f"{name} contains NaN or Inf")
+
+    def __check_gradients(self, grads, variables, name):
+        if len(grads) != len(variables):
+            raise ValueError(
+                f"{name} gradient/variable count mismatch: {len(grads)} != {len(variables)}"
+            )
+        disconnected = [var.name for grad, var in zip(grads, variables) if grad is None]
+        if disconnected:
+            raise ValueError(f"{name} has disconnected gradients: {disconnected}")
+
+        gradient_values = []
+        for grad, variable in zip(grads, variables):
+            value = grad.values if isinstance(grad, tf.IndexedSlices) else grad
+            tf.debugging.assert_all_finite(
+                value, message=f"{name} gradient for {variable.name} contains NaN or Inf"
+            )
+            gradient_values.append(value)
+        grad_norm = tf.linalg.global_norm(gradient_values)
+        tf.debugging.assert_all_finite(
+            grad_norm, message=f"{name} global gradient norm contains NaN or Inf"
+        )
+        return grad_norm
+
+    def __check_main_outputs(
+        self, pred, label, labeled_loss, unlabeled_loss, overall_loss, num_classes
+    ):
+        batch_size = tf.shape(label)[0]
+        tf.debugging.assert_rank(pred, 1, message="pred must have shape [B]")
+        tf.debugging.assert_equal(
+            tf.shape(pred)[0], batch_size, message="pred batch dimension mismatch"
+        )
+        if not pred.dtype.is_integer:
+            raise TypeError(f"pred must have an integer dtype, got {pred.dtype.name}")
+        tf.debugging.assert_greater_equal(
+            pred, tf.cast(0, pred.dtype), message="pred contains a negative class index"
+        )
+        tf.debugging.assert_less(
+            pred,
+            tf.cast(num_classes, pred.dtype),
+            message="pred exceeds the configured class count",
+        )
+        self.__check_vector(labeled_loss, batch_size, "labeled_loss")
+        tf.debugging.assert_rank(unlabeled_loss, 0, message="unlabeled_loss must be scalar")
+        tf.debugging.assert_all_finite(
+            unlabeled_loss, message="unlabeled_loss contains NaN or Inf"
+        )
+        self.__check_vector(overall_loss, batch_size, "overall_loss")
     # daeo方法需要采用下面这个带有vae_loss的__train_model_with_batch方法，而其余的采用下面的不带vae_loss的__train_model_with_batch
-    def __train_model_with_batch(self, model, optimizer, labeled_dataloader, unlabeled_dataloader):
+    def __train_model_with_batch(
+        self,
+        model,
+        optimizer,
+        labeled_dataloader,
+        unlabeled_dataloader,
+        force_runtime_checks=False,
+    ):
         labeled_data, label = self.__get_data(labeled_dataloader)
-        unlabeled_data, _ = self.__get_data(unlabeled_dataloader)
+        unlabeled_data, unlabeled_label = self.__get_data(unlabeled_dataloader)
+        step = self.__train_step + 1
+        should_check = force_runtime_checks or (
+            self.__runtime_check_every > 0
+            and (step - 1) % self.__runtime_check_every == 0
+        )
+        if should_check:
+            self.__check_batch(labeled_data, label, "labeled", model.K)
+            self.__check_batch(unlabeled_data, unlabeled_label, "unlabeled", model.K)
         with tf.GradientTape() as tape:
             vae_loss = model.train_vae_with_labeled_data(labeled_data, label)
         trainable_variables = model.vae.trainable_variables
         grads = tape.gradient(vae_loss, trainable_variables)
+        if should_check:
+            self.__check_vector(vae_loss, tf.shape(label)[0], "vae_loss")
+            vae_grad_norm = self.__check_gradients(grads, trainable_variables, "vae")
         optimizer.apply_gradients(zip(grads, trainable_variables))
         with tf.GradientTape() as tape:
             pred, labeled_loss, unlabeled_loss = model(labeled_data, label, unlabeled_data)
             overall_loss = labeled_loss + unlabeled_loss
         trainable_variables = [model.cluster] + model.encoder.trainable_variables + model.fc.trainable_variables
         grads = tape.gradient(overall_loss, trainable_variables)
+        if should_check:
+            self.__check_main_outputs(
+                pred, label, labeled_loss, unlabeled_loss, overall_loss, model.K
+            )
+            main_grad_norm = self.__check_gradients(grads, trainable_variables, "main")
         optimizer.apply_gradients(zip(grads, trainable_variables))
         acc = model.accuracy(pred, label)
+        if should_check:
+            tf.debugging.assert_all_finite(acc, message="accuracy contains NaN or Inf")
+            tf.print(
+                "[runtime-check]",
+                "step=", step,
+                "labeled_input=", tf.shape(labeled_data[0]),
+                "unlabeled_input=", tf.shape(unlabeled_data[0]),
+                "image=", tf.shape(labeled_data[-1]),
+                "pred=", tf.shape(pred),
+                "vae_loss_mean=", tf.reduce_mean(vae_loss),
+                "labeled_loss_mean=", tf.reduce_mean(labeled_loss),
+                "unlabeled_loss=", unlabeled_loss,
+                "overall_loss_mean=", tf.reduce_mean(overall_loss),
+                "vae_grad_norm=", vae_grad_norm,
+                "main_grad_norm=", main_grad_norm,
+            )
+        self.__train_step = step
         return overall_loss, acc
 
     # def __train_model_with_batch(self, model, optimizer, labeled_dataloader, unlabeled_dataloader):
@@ -114,6 +287,20 @@ class GCDMRelFramework(object):
     #     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     #     acc = model.accuracy(pred, label)
     #     return overall_loss, acc
+
+    def smoke_test(self, model, lr: float):
+        optimizer = tf.optimizers.Adam(learning_rate=lr)
+        loss, accuracy = self.__train_model_with_batch(
+            model,
+            optimizer,
+            self.__train_dataloader,
+            self.__test_dataloader,
+            force_runtime_checks=True,
+        )
+        return {
+            "loss": float(tf.reduce_mean(loss).numpy()),
+            "accuracy": float(accuracy.numpy()),
+        }
 
     def train(
         self,

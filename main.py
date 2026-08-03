@@ -26,9 +26,21 @@ def main():
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--model_path", type=str, default="./weights")
     parser.add_argument("--fine_tune", type=int, choices=[0, 1], default=1)
-    parser.add_argument("--mode", type=str, choices=["train", "test"], default="train")
+    parser.add_argument(
+        "--mode", type=str, choices=["train", "test", "smoke"], default="train"
+    )
+    parser.add_argument(
+        "--runtime_check_every",
+        type=int,
+        default=0,
+        help="Run shape/finite/gradient checks every N training steps; 0 disables them.",
+    )
     parser.add_argument("--model", type=str, choices=["kmeans", "rankstats", "uno", "gcd", "simgcd", "daeo", "sae"])
     args = parser.parse_args()
+    if args.runtime_check_every < 0:
+        parser.error("--runtime_check_every must be greater than or equal to 0")
+    if args.mode == "smoke" and args.model != "daeo":
+        parser.error("--mode smoke currently supports only --model daeo")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -59,7 +71,7 @@ def main():
         base_category, train_dataset, textProcessor, batch_size, balanced_sampling=True
     )
     val_dataloader, val_iter = get_loader(base_category, val_dataset, textProcessor, batch_size)
-    if args.mode == "train":
+    if args.mode in ("train", "smoke"):
         test_dataloader, test_iter = get_loader(
             base_category + novel_category, test_dataset, textProcessor, batch_size, shuffle=True
         )
@@ -94,9 +106,17 @@ def main():
         test_dataloader=test_dataloader,
         base_category=base_category,
         novel_category=novel_category,
+        runtime_check_every=args.runtime_check_every,
     )
 
-    if args.mode == "train":
+    if args.mode == "smoke":
+        smoke_metrics = framework.smoke_test(model, args.lr)
+        print(
+            "Smoke test passed: loss={0:.6f}, train_acc={1:.2f}%".format(
+                smoke_metrics["loss"], smoke_metrics["accuracy"] * 100
+            )
+        )
+    elif args.mode == "train":
         framework.train(
             model,
             args.lr,
