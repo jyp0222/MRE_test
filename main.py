@@ -27,7 +27,16 @@ def main():
     parser.add_argument("--model_path", type=str, default="./weights")
     parser.add_argument("--fine_tune", type=int, choices=[0, 1], default=1)
     parser.add_argument(
-        "--mode", type=str, choices=["train", "test", "smoke"], default="train"
+        "--mode",
+        type=str,
+        choices=["train", "test", "smoke", "overfit"],
+        default="train",
+    )
+    parser.add_argument(
+        "--overfit_steps",
+        type=int,
+        default=20,
+        help="Number of repeated updates on one cached batch in --mode overfit.",
     )
     parser.add_argument(
         "--runtime_check_every",
@@ -35,12 +44,55 @@ def main():
         default=0,
         help="Run shape/finite/gradient checks every N training steps; 0 disables them.",
     )
+    parser.add_argument(
+        "--use_module_b",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Enable the adapted curvature-aware fusion module; disabled by default.",
+    )
+    parser.add_argument("--module_b_dim", type=int, default=128)
+    parser.add_argument("--module_b_residual_scale", type=float, default=0.05)
+    parser.add_argument("--module_b_curvature_init", type=float, default=1.0)
+    parser.add_argument("--module_b_curvature_min", type=float, default=0.05)
+    parser.add_argument("--module_b_curvature_max", type=float, default=5.0)
+    parser.add_argument("--module_b_prior_strength", type=float, default=0.1)
+    parser.add_argument(
+        "--module_b_temperature",
+        type=float,
+        default=0.0,
+        help="Positive initial temperature; 0 uses sqrt(module_b_dim).",
+    )
+    parser.add_argument("--module_b_tangent_scale", type=float, default=1.0)
+    parser.add_argument("--module_b_tangent_norm_max", type=float, default=2.0)
     parser.add_argument("--model", type=str, choices=["kmeans", "rankstats", "uno", "gcd", "simgcd", "daeo", "sae"])
     args = parser.parse_args()
     if args.runtime_check_every < 0:
         parser.error("--runtime_check_every must be greater than or equal to 0")
-    if args.mode == "smoke" and args.model != "daeo":
-        parser.error("--mode smoke currently supports only --model daeo")
+    if args.mode in ("smoke", "overfit") and args.model != "daeo":
+        parser.error("--mode smoke/overfit currently supports only --model daeo")
+    if args.overfit_steps <= 0:
+        parser.error("--overfit_steps must be positive")
+    if args.use_module_b and args.model != "daeo":
+        parser.error("--use_module_b currently supports only --model daeo")
+    if args.module_b_dim <= 0:
+        parser.error("--module_b_dim must be positive")
+    if args.module_b_residual_scale < 0:
+        parser.error("--module_b_residual_scale must be non-negative")
+    if not 0 < args.module_b_curvature_min < args.module_b_curvature_max:
+        parser.error("module B curvature bounds must satisfy 0 < min < max")
+    if not (
+        args.module_b_curvature_min
+        <= args.module_b_curvature_init
+        <= args.module_b_curvature_max
+    ):
+        parser.error("--module_b_curvature_init must lie inside its bounds")
+    if args.module_b_prior_strength < 0:
+        parser.error("--module_b_prior_strength must be non-negative")
+    if args.module_b_temperature < 0:
+        parser.error("--module_b_temperature must be non-negative")
+    if args.module_b_tangent_scale <= 0 or args.module_b_tangent_norm_max <= 0:
+        parser.error("module B tangent scale and norm limit must be positive")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -71,7 +123,7 @@ def main():
         base_category, train_dataset, textProcessor, batch_size, balanced_sampling=True
     )
     val_dataloader, val_iter = get_loader(base_category, val_dataset, textProcessor, batch_size)
-    if args.mode in ("train", "smoke"):
+    if args.mode in ("train", "smoke", "overfit"):
         test_dataloader, test_iter = get_loader(
             base_category + novel_category, test_dataset, textProcessor, batch_size, shuffle=True
         )
@@ -85,6 +137,42 @@ def main():
 
     sentence_encoder = BERTSentenceEncoder(args.bert_path, fine_tune=bool(args.fine_tune))
     multimodal_encoder = SimpleMultimodalEncoder(sentence_encoder)
+    if args.use_module_b:
+        from modular_multimodal_encoder import ModuleBMultimodalEncoder
+
+        temperature_init = (
+            None if args.module_b_temperature == 0 else args.module_b_temperature
+        )
+        multimodal_encoder = ModuleBMultimodalEncoder(
+            multimodal_encoder,
+            fusion_dim=args.module_b_dim,
+            residual_scale=args.module_b_residual_scale,
+            curvature_init=args.module_b_curvature_init,
+            curvature_min=args.module_b_curvature_min,
+            curvature_max=args.module_b_curvature_max,
+            prior_strength_init=args.module_b_prior_strength,
+            temperature_init=temperature_init,
+            tangent_scale=args.module_b_tangent_scale,
+            tangent_norm_max=args.module_b_tangent_norm_max,
+            initializer_seed=args.seed + 10000,
+        )
+        print(
+            "Module B enabled:",
+            {
+                "fusion_dim": args.module_b_dim,
+                "residual_scale": args.module_b_residual_scale,
+                "curvature_init": args.module_b_curvature_init,
+                "curvature_bounds": (
+                    args.module_b_curvature_min,
+                    args.module_b_curvature_max,
+                ),
+                "prior_strength": args.module_b_prior_strength,
+                "temperature": temperature_init or "sqrt(fusion_dim)",
+                "tangent_scale": args.module_b_tangent_scale,
+                "tangent_norm_max": args.module_b_tangent_norm_max,
+                "initializer_seed": args.seed + 10000,
+            },
+        )
     if args.model == "kmeans":
         model = KMeans(multimodal_encoder, K, 768 * 4, use_img=True)
     elif args.model == "rankstats":
@@ -114,6 +202,18 @@ def main():
         print(
             "Smoke test passed: loss={0:.6f}, train_acc={1:.2f}%".format(
                 smoke_metrics["loss"], smoke_metrics["accuracy"] * 100
+            )
+        )
+    elif args.mode == "overfit":
+        overfit_metrics = framework.overfit_test(model, args.lr, args.overfit_steps)
+        print(
+            "Overfit test finished: "
+            "initial_loss={0:.6f}, final_loss={1:.6f}, "
+            "initial_acc={2:.2f}%, final_acc={3:.2f}%".format(
+                overfit_metrics["initial_loss"],
+                overfit_metrics["final_loss"],
+                overfit_metrics["initial_accuracy"] * 100,
+                overfit_metrics["final_accuracy"] * 100,
             )
         )
     elif args.mode == "train":

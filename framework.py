@@ -219,6 +219,80 @@ class GCDMRelFramework(object):
             unlabeled_loss, message="unlabeled_loss contains NaN or Inf"
         )
         self.__check_vector(overall_loss, batch_size, "overall_loss")
+
+    def __check_module_b_diagnostics(self, model):
+        if not hasattr(model.encoder, "module_b_diagnostics"):
+            return
+
+        diagnostics = model.encoder.module_b_diagnostics()
+        required = (
+            "text_curvature",
+            "image_curvature",
+            "text_weight",
+            "image_weight",
+            "attention_entropy",
+            "residual_ratio",
+            "manifold_error",
+        )
+        missing = [name for name in required if name not in diagnostics]
+        if missing:
+            raise ValueError(f"module B diagnostics are missing: {missing}")
+        for name in required:
+            value = diagnostics[name]
+            tf.debugging.assert_rank(value, 0, message=f"module B {name} must be scalar")
+            tf.debugging.assert_all_finite(
+                value, message=f"module B {name} contains NaN or Inf"
+            )
+
+        tf.debugging.assert_positive(
+            diagnostics["text_curvature"], message="module B text curvature is not positive"
+        )
+        tf.debugging.assert_positive(
+            diagnostics["image_curvature"], message="module B image curvature is not positive"
+        )
+        for name in ("text_weight", "image_weight"):
+            tf.debugging.assert_greater_equal(
+                diagnostics[name], 0.0, message=f"module B {name} is negative"
+            )
+            tf.debugging.assert_less_equal(
+                diagnostics[name], 1.0, message=f"module B {name} exceeds one"
+            )
+        tf.debugging.assert_near(
+            diagnostics["text_weight"] + diagnostics["image_weight"],
+            tf.constant(1.0, dtype=tf.float32),
+            atol=1e-5,
+            message="module B mean modality weights do not sum to one",
+        )
+        tf.debugging.assert_greater_equal(
+            diagnostics["attention_entropy"],
+            0.0,
+            message="module B attention entropy is negative",
+        )
+        tf.debugging.assert_less_equal(
+            diagnostics["attention_entropy"],
+            tf.math.log(tf.constant(2.0, dtype=tf.float32)) + 1e-5,
+            message="module B attention entropy exceeds log(2)",
+        )
+        tf.debugging.assert_greater_equal(
+            diagnostics["residual_ratio"],
+            0.0,
+            message="module B residual ratio is negative",
+        )
+        tf.debugging.assert_less_equal(
+            diagnostics["manifold_error"],
+            1e-3,
+            message="module B Lorentz constraint error is too large",
+        )
+        tf.print(
+            "[module-b]",
+            "text_curvature=", diagnostics["text_curvature"],
+            "image_curvature=", diagnostics["image_curvature"],
+            "text_weight=", diagnostics["text_weight"],
+            "image_weight=", diagnostics["image_weight"],
+            "attention_entropy=", diagnostics["attention_entropy"],
+            "residual_ratio=", diagnostics["residual_ratio"],
+            "manifold_error=", diagnostics["manifold_error"],
+        )
     # daeo方法需要采用下面这个带有vae_loss的__train_model_with_batch方法，而其余的采用下面的不带vae_loss的__train_model_with_batch
     def __train_model_with_batch(
         self,
@@ -227,9 +301,17 @@ class GCDMRelFramework(object):
         labeled_dataloader,
         unlabeled_dataloader,
         force_runtime_checks=False,
+        labeled_batch=None,
+        unlabeled_batch=None,
     ):
-        labeled_data, label = self.__get_data(labeled_dataloader)
-        unlabeled_data, unlabeled_label = self.__get_data(unlabeled_dataloader)
+        if labeled_batch is None:
+            labeled_data, label = self.__get_data(labeled_dataloader)
+        else:
+            labeled_data, label = labeled_batch
+        if unlabeled_batch is None:
+            unlabeled_data, unlabeled_label = self.__get_data(unlabeled_dataloader)
+        else:
+            unlabeled_data, unlabeled_label = unlabeled_batch
         step = self.__train_step + 1
         should_check = force_runtime_checks or (
             self.__runtime_check_every > 0
@@ -260,6 +342,7 @@ class GCDMRelFramework(object):
         acc = model.accuracy(pred, label)
         if should_check:
             tf.debugging.assert_all_finite(acc, message="accuracy contains NaN or Inf")
+            self.__check_module_b_diagnostics(model)
             tf.print(
                 "[runtime-check]",
                 "step=", step,
@@ -300,6 +383,38 @@ class GCDMRelFramework(object):
         return {
             "loss": float(tf.reduce_mean(loss).numpy()),
             "accuracy": float(accuracy.numpy()),
+        }
+
+    def overfit_test(self, model, lr: float, steps: int = 20):
+        if steps <= 0:
+            raise ValueError("overfit steps must be positive")
+        optimizer = tf.optimizers.Adam(learning_rate=lr)
+        labeled_batch = self.__get_data(self.__train_dataloader)
+        unlabeled_batch = self.__get_data(self.__test_dataloader)
+        history = []
+        for index in range(steps):
+            loss, accuracy = self.__train_model_with_batch(
+                model,
+                optimizer,
+                self.__train_dataloader,
+                self.__test_dataloader,
+                force_runtime_checks=index in (0, steps - 1),
+                labeled_batch=labeled_batch,
+                unlabeled_batch=unlabeled_batch,
+            )
+            mean_loss = float(tf.reduce_mean(loss).numpy())
+            accuracy_value = float(accuracy.numpy())
+            history.append((mean_loss, accuracy_value))
+            print(
+                "[overfit] step={0}/{1} loss={2:.6f} accuracy={3:.2f}%".format(
+                    index + 1, steps, mean_loss, accuracy_value * 100
+                )
+            )
+        return {
+            "initial_loss": history[0][0],
+            "final_loss": history[-1][0],
+            "initial_accuracy": history[0][1],
+            "final_accuracy": history[-1][1],
         }
 
     def train(
