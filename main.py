@@ -24,6 +24,17 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--epoch", type=int, default=25)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument(
+        "--checkpoint_tie_policy",
+        type=str,
+        choices=["latest", "first"],
+        default="latest",
+        help=(
+            "Checkpoint to keep when validation accuracy ties: latest preserves "
+            "the original behavior; first keeps the earlier checkpoint from "
+            "the current training run."
+        ),
+    )
     parser.add_argument("--model_path", type=str, default="./weights")
     parser.add_argument("--fine_tune", type=int, choices=[0, 1], default=1)
     parser.add_argument(
@@ -225,6 +236,7 @@ def main():
             train_iter,
             val_iter,
             model_path,
+            args.checkpoint_tie_policy,
         )
     elif args.mode == "test":
         base_acc, novel_acc, overall_acc = framework.eval(

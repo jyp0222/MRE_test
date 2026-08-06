@@ -13,6 +13,25 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
+
+CHECKPOINT_TIE_POLICIES = ("latest", "first")
+
+
+def _checkpoint_decision(best_acc, val_acc, tie_policy, has_checkpoint):
+    """Return whether to save and whether validation reset patience."""
+    if tie_policy not in CHECKPOINT_TIE_POLICIES:
+        raise ValueError(
+            "checkpoint_tie_policy must be one of {}".format(
+                CHECKPOINT_TIE_POLICIES
+            )
+        )
+    if best_acc < val_acc:
+        return True, True
+    if best_acc == val_acc:
+        should_save = tie_policy == "latest" or not has_checkpoint
+        return should_save, True
+    return False, False
+
 class GCDMNetModel(tf.keras.models.Model):
     def __init__(self, encoder, use_img):
         super(GCDMNetModel, self).__init__()
@@ -426,13 +445,21 @@ class GCDMRelFramework(object):
         train_iter: int,
         val_iter: int,
         model_path: str,
+        checkpoint_tie_policy: str = "latest",
     ):
+        if checkpoint_tie_policy not in CHECKPOINT_TIE_POLICIES:
+            raise ValueError(
+                "checkpoint_tie_policy must be one of {}".format(
+                    CHECKPOINT_TIE_POLICIES
+                )
+            )
         labeled_dataloader = self.__train_dataloader
         unlabeled_dataloader = self.__test_dataloader
         losses = []
         train_accs = []
         acc = 0.0
         n_patience = 0
+        has_checkpoint = False
         optimizer = tf.optimizers.Adam(learning_rate=lr)
         for e in range(1, epoch + 1):
             losses.clear()
@@ -455,13 +482,25 @@ class GCDMRelFramework(object):
                 self.progress.advance(train_tqdm, advance=1)
                 self.progress.update(train_tqdm, info=info)
             val_acc = self.eval(model, val_iter)
-            if acc <= val_acc:
+            should_save, reset_patience = _checkpoint_decision(
+                acc,
+                val_acc,
+                checkpoint_tie_policy,
+                has_checkpoint,
+            )
+            if reset_patience:
                 acc = val_acc
                 n_patience = 0
-                self.progress.log("[bold green]Best checkpoint")
-                info = "Acc {0:3.2f}".format(acc * 100)
-                self.progress.log("[bold blue] Valid result: " + info)
-                model.save_weights(model_path)
+                if should_save:
+                    self.progress.log("[bold green]Best checkpoint")
+                    info = "Acc {0:3.2f}".format(acc * 100)
+                    self.progress.log("[bold blue] Valid result: " + info)
+                    model.save_weights(model_path)
+                    has_checkpoint = True
+                else:
+                    self.progress.log(
+                        "[bold yellow]Validation tie: keeping earlier checkpoint"
+                    )
             else:
                 n_patience += 1
                 if n_patience == patience:
