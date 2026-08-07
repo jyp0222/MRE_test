@@ -312,6 +312,74 @@ class GCDMRelFramework(object):
             "residual_ratio=", diagnostics["residual_ratio"],
             "manifold_error=", diagnostics["manifold_error"],
         )
+
+    def __check_module_c_diagnostics(self, model):
+        if not hasattr(model.encoder, "module_c_diagnostics"):
+            return
+
+        diagnostics = model.encoder.module_c_diagnostics()
+        required = (
+            "attribute_weight",
+            "text_weight",
+            "gate_std",
+            "saturation",
+            "brightness",
+            "texture_proxy",
+            "contrast",
+            "residual_ratio",
+        )
+        missing = [name for name in required if name not in diagnostics]
+        if missing:
+            raise ValueError(f"module C diagnostics are missing: {missing}")
+        for name in required:
+            value = diagnostics[name]
+            tf.debugging.assert_rank(value, 0, message=f"module C {name} must be scalar")
+            tf.debugging.assert_all_finite(
+                value, message=f"module C {name} contains NaN or Inf"
+            )
+
+        for name in ("attribute_weight", "text_weight"):
+            tf.debugging.assert_greater_equal(
+                diagnostics[name], 0.0, message=f"module C {name} is negative"
+            )
+            tf.debugging.assert_less_equal(
+                diagnostics[name], 1.0, message=f"module C {name} exceeds one"
+            )
+        tf.debugging.assert_near(
+            diagnostics["attribute_weight"] + diagnostics["text_weight"],
+            tf.constant(1.0, dtype=tf.float32),
+            atol=1e-5,
+            message="module C mean gate weights do not sum to one",
+        )
+        tf.debugging.assert_greater_equal(
+            diagnostics["gate_std"], 0.0, message="module C gate std is negative"
+        )
+        tf.debugging.assert_less_equal(
+            diagnostics["gate_std"], 0.5 + 1e-5, message="module C gate std is invalid"
+        )
+        for name in ("saturation", "brightness", "texture_proxy", "contrast"):
+            tf.debugging.assert_greater_equal(
+                diagnostics[name], 0.0, message=f"module C {name} is negative"
+            )
+            tf.debugging.assert_less_equal(
+                diagnostics[name], 1.0, message=f"module C {name} exceeds one"
+            )
+        tf.debugging.assert_greater_equal(
+            diagnostics["residual_ratio"],
+            0.0,
+            message="module C residual ratio is negative",
+        )
+        tf.print(
+            "[module-c]",
+            "attribute_weight=", diagnostics["attribute_weight"],
+            "text_weight=", diagnostics["text_weight"],
+            "gate_std=", diagnostics["gate_std"],
+            "saturation=", diagnostics["saturation"],
+            "brightness=", diagnostics["brightness"],
+            "texture_proxy=", diagnostics["texture_proxy"],
+            "contrast=", diagnostics["contrast"],
+            "residual_ratio=", diagnostics["residual_ratio"],
+        )
     # daeo方法需要采用下面这个带有vae_loss的__train_model_with_batch方法，而其余的采用下面的不带vae_loss的__train_model_with_batch
     def __train_model_with_batch(
         self,
@@ -362,6 +430,7 @@ class GCDMRelFramework(object):
         if should_check:
             tf.debugging.assert_all_finite(acc, message="accuracy contains NaN or Inf")
             self.__check_module_b_diagnostics(model)
+            self.__check_module_c_diagnostics(model)
             tf.print(
                 "[runtime-check]",
                 "step=", step,

@@ -76,6 +76,15 @@ def main():
     )
     parser.add_argument("--module_b_tangent_scale", type=float, default=1.0)
     parser.add_argument("--module_b_tangent_norm_max", type=float, default=2.0)
+    parser.add_argument(
+        "--use_module_c",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Enable the adapted TEDFusion attribute-text gate; disabled by default.",
+    )
+    parser.add_argument("--module_c_gate_dim", type=int, default=64)
+    parser.add_argument("--module_c_residual_scale", type=float, default=0.01)
     parser.add_argument("--model", type=str, choices=["kmeans", "rankstats", "uno", "gcd", "simgcd", "daeo", "sae"])
     args = parser.parse_args()
     if args.runtime_check_every < 0:
@@ -86,6 +95,10 @@ def main():
         parser.error("--overfit_steps must be positive")
     if args.use_module_b and args.model != "daeo":
         parser.error("--use_module_b currently supports only --model daeo")
+    if args.use_module_c and args.model != "daeo":
+        parser.error("--use_module_c currently supports only --model daeo")
+    if args.use_module_b and args.use_module_c:
+        parser.error("modules B and C cannot be combined before stage 8")
     if args.module_b_dim <= 0:
         parser.error("--module_b_dim must be positive")
     if args.module_b_residual_scale < 0:
@@ -104,6 +117,10 @@ def main():
         parser.error("--module_b_temperature must be non-negative")
     if args.module_b_tangent_scale <= 0 or args.module_b_tangent_norm_max <= 0:
         parser.error("module B tangent scale and norm limit must be positive")
+    if args.module_c_gate_dim <= 0:
+        parser.error("--module_c_gate_dim must be positive")
+    if args.module_c_residual_scale < 0:
+        parser.error("--module_c_residual_scale must be non-negative")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -182,6 +199,29 @@ def main():
                 "tangent_scale": args.module_b_tangent_scale,
                 "tangent_norm_max": args.module_b_tangent_norm_max,
                 "initializer_seed": args.seed + 10000,
+            },
+        )
+    elif args.use_module_c:
+        from module_c_multimodal_encoder import ModuleCMultimodalEncoder
+
+        multimodal_encoder = ModuleCMultimodalEncoder(
+            multimodal_encoder,
+            gate_dim=args.module_c_gate_dim,
+            residual_scale=args.module_c_residual_scale,
+            initializer_seed=args.seed + 20000,
+        )
+        print(
+            "Module C enabled:",
+            {
+                "gate_dim": args.module_c_gate_dim,
+                "residual_scale": args.module_c_residual_scale,
+                "attributes": [
+                    "saturation",
+                    "brightness",
+                    "texture_proxy",
+                    "contrast",
+                ],
+                "initializer_seed": args.seed + 20000,
             },
         )
     if args.model == "kmeans":
